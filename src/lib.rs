@@ -8,6 +8,8 @@ pub mod route;
 
 pub mod proc;
 
+pub type ResponseCode = u16;
+
 #[cfg(test)]
 mod tests {
     #[test]

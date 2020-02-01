@@ -13,7 +13,7 @@ pub struct ContextBundle<RS>
 }
 
 #[derive(Debug)]
-pub enum UpdateContextBundle<O, E>
+pub enum ResultContextBundle<O, E>
     where O: OkResultContext, E: ErrResultContext {
     Ok {
         result: O,
@@ -25,23 +25,23 @@ pub enum UpdateContextBundle<O, E>
     }
 }
 
-impl<O, E> UpdateContextBundle<O, E>
+impl<O, E> ResultContextBundle<O, E>
     where O: OkResultContext, E: ErrResultContext {
 
     fn fail_err_unwrap(&self) -> ! {
-        panic!("Failed unwrap on an Err variant of {:?}", &self)
+        panic!("`Ok` unwrap attempted on `Err` variant of {:?}", &self)
     }
 
     fn fail_fix_good(&self) -> ! {
-        panic!("Attempted fix on a good context: {:?}", &self)
+        panic!("Attempted fix on a `Ok` context: {:?}", &self)
     }
 
     fn fail_unwrap_err_on_good(&self) -> ! {
-        panic!("Attempted error unwrap on a good context: {:?}", &self)
+        panic!("Attempted `Err` unwrap on a `Ok` context: {:?}", &self)
     }
 
     pub fn unwrap(self) -> ContextBundle<O> {
-        use UpdateContextBundle::*;
+        use ResultContextBundle::*;
         if let Ok { result, request } = self {
             ContextBundle { result, request }
         } else {
@@ -49,14 +49,18 @@ impl<O, E> UpdateContextBundle<O, E>
         }
     }
 
-    pub async fn fix<U: Update>(self, update: U) -> UpdateContextBundle<O, E> {
-        if let UpdateContextBundle::Err { result, request } = self {
+    /// Try to fix the context by applying given update.
+    ///
+    /// # Panics
+    /// Panic arises when function is called over a healthy context.
+    pub async fn amend<U: Update>(self, update: U) -> ResultContextBundle<O, E> {
+        if let ResultContextBundle::Err { result, request } = self {
             match result.apply(update) {
-                Err(e) => UpdateContextBundle::Err {
+                Err(e) => ResultContextBundle::Err {
                     result: e,
                     request,
                 },
-                Ok(v) => UpdateContextBundle::Ok {
+                Ok(v) => ResultContextBundle::Ok {
                     result: v,
                     request,
                 }
@@ -67,7 +71,7 @@ impl<O, E> UpdateContextBundle<O, E>
     }
 
     pub fn is_ok(&self) -> bool {
-        use UpdateContextBundle::*;
+        use ResultContextBundle::*;
         match self {
             Ok { result: _, request: _ } => true,
             Err { result: _, request: _ } => false,
@@ -79,7 +83,7 @@ impl<O, E> UpdateContextBundle<O, E>
     }
 
     pub fn err(&self) -> &E {
-        if let UpdateContextBundle::Err { result, request: _ } = &self {
+        if let ResultContextBundle::Err { result, request: _ } = &self {
             result
         } else {
             self.fail_err_unwrap()
@@ -87,7 +91,7 @@ impl<O, E> UpdateContextBundle<O, E>
     }
 
     pub fn unwrap_err(self) -> ContextBundle<E> {
-        use UpdateContextBundle::*;
+        use ResultContextBundle::*;
         if let Err { result, request } = self {
             ContextBundle {
                 result,
@@ -99,30 +103,47 @@ impl<O, E> UpdateContextBundle<O, E>
     }
 
     /// Update the value using provided Process.
-    pub async fn update<P, U>(self, _: P) -> UpdateContextBundle<O, E> where
+    pub async fn update<P, U>(self, process: P) -> ResultContextBundle<O, E> where
         U: Update,
         P: Process<RS=O, Result=U> + Send + Sync {
-        P::update(self.unwrap()).await
+        process.exec_over(self.unwrap()).await
     }
 
     /// Update the value using provided process. If the value is broken then fix it before
     /// update using process.
-    pub async fn update_fixed<P, F, U>(self, process: P, _fix: F) -> UpdateContextBundle<O, E> where
+    pub async fn update_fixed<P, F, U>(self, process: P, fix: F) -> ResultContextBundle<O, E> where
         U: Update,
         P: Process<RS=O, Result=U> + Send + Sync,
         F: Process<RS=E, Result=U> + Send + Sync {
-        let fixed = if self.is_err() {
-            let unwrap = self.unwrap_err();
-            let update = F::exec(&unwrap).await;
-            let update_context = UpdateContextBundle::Err {
-                result: unwrap.result,
-                request: unwrap.request,
-            };
-            update_context.fix::<U>(update).await.into()
+        self.continue_or_fix(fix).await
+            .update(process).await
+    }
+
+    /// Continue the flow if context is valid or attempt the fix if it is broken.
+    pub async fn continue_or_fix<F, U>(self, fix: F) -> ResultContextBundle<O, E> where
+        U: Update,
+        F: Process<RS=E, Result=U> + Send + Sync {
+        if self.is_err() {
+            self.fix(fix).await
         } else {
             self
+        }
+    }
+
+    /// Attempt to fix broken context.
+    ///
+    /// # Panics
+    /// Panic will arise if context is already healthy.
+    pub async fn fix<F, U>(self, fix: F) -> ResultContextBundle<O, E> where
+        U: Update,
+        F: Process<RS=E, Result=U> + Send + Sync {
+        let unwrap = self.unwrap_err();
+        let update = fix.exec(&unwrap).await;
+        let update_context = ResultContextBundle::Err {
+            result: unwrap.result,
+            request: unwrap.request,
         };
-        fixed.update(process).await
+        update_context.amend::<U>(update).await.into()
     }
 }
 
@@ -130,27 +151,27 @@ impl<O, E> UpdateContextBundle<O, E>
 pub trait Update {}
 
 #[async_trait]
-pub trait Process {
+pub trait Process: Sized {
 
     type RS: ResultContext;
     type Result: Update;
 
     /// Execute this process and get `Update` object.
-    async fn exec(context: &ContextBundle<Self::RS>) -> Self::Result;
+    async fn exec(self, context: &ContextBundle<Self::RS>) -> Self::Result;
 
     /// Execute this process and apply produced `Update` to current context.
-    async fn update<O, E>(context: ContextBundle<Self::RS>)
-        -> UpdateContextBundle<O, E> where
+    async fn exec_over<O, E>(self, context: ContextBundle<Self::RS>)
+                             -> ResultContextBundle<O, E> where
         O: OkResultContext,
         E: ErrResultContext {
-        let result = Self::exec(&context).await;
+        let result = self.exec(&context).await;
         let result = context.result.apply(result);
         match result {
-            Ok(v) => UpdateContextBundle::Ok {
+            Ok(v) => ResultContextBundle::Ok {
                 result: v,
                 request: context.request,
             },
-            Err(e) => UpdateContextBundle::Err {
+            Err(e) => ResultContextBundle::Err {
                 result: e,
                 request: context.request,
             },

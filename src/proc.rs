@@ -180,6 +180,15 @@ pub trait Process: Sized {
     }
 }
 
+/// Full description of route handling.
+#[async_trait]
+pub trait RouteHandle {
+
+    type R: ResponseContext;
+
+    async fn handle(self, req: RequestContext) -> Self::R;
+}
+
 #[async_trait]
 pub trait OkResultContext: ResultContext {}
 

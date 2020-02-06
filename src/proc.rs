@@ -1,9 +1,181 @@
-use std::fmt::Debug;
+use std::fmt::{Debug, Formatter, Error};
 use crate::ResponseCode;
+use std::pin::Pin;
+use std::cell::Cell;
+use std::sync::Mutex;
 
 #[derive(Debug)]
 pub struct RequestContext {
 
+    url_info: UrlInfo,
+}
+
+/// Pointer to string slice inside of a `UrlInfo`.
+#[derive(Clone, Copy)]
+pub struct StrRef(*const u8, usize);
+
+impl From<(*const u8, usize)> for StrRef {
+
+    fn from(tuple: (*const u8, usize)) -> Self {
+        StrRef(tuple.0, tuple.1)
+    }
+}
+
+impl From<&[u8]> for StrRef {
+
+    fn from(slice: &[u8]) -> Self {
+        (slice.as_ptr(), slice.len()).into()
+    }
+}
+
+impl AsRef<str> for StrRef {
+
+    fn as_ref(&self) -> &str {
+        unsafe {
+            let slice = std::slice::from_raw_parts(self.0, self.1);
+            std::str::from_utf8_unchecked(slice)
+        }
+    }
+}
+
+impl Debug for StrRef {
+
+    fn fmt(&self, f: &mut Formatter) -> Result<(), Error> {
+        self.as_ref().fmt(f)
+    }
+}
+
+unsafe impl Send for StrRef {}
+unsafe impl Sync for StrRef {}
+
+struct UrlInfo {
+
+    /// Original URL as it was delivered to the server.
+    /// # Example
+    /// For `http://example.com/admin/new?q=something` result is `/admin/new?q=something`.
+    original_url: Pin<String>,
+
+    parse_mutex: Mutex<()>,
+
+    /// Parsed parameters in the URL. Is lazily loaded.
+    params: Cell<Vec<Param>>,
+
+    /// Full path in the URL excluding parameters. Is lazily loaded.
+    /// # Example
+    /// For `http://example.com/admin/new?q=something` result is `/admin/new`.
+    path: Cell<Option<StrRef>>,
+
+    parts: Cell<Vec<StrRef>>,
+}
+
+impl Debug for UrlInfo {
+
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        write!(
+            f,
+            "UrlInfo {{ \
+            original_url: {:?}, \
+            params: {:?}, \
+            path: {:?}, \
+            parts: {:?}}}",
+            self.original_url,
+            unsafe { &*self.params.as_ptr() },
+            self.path.get().unwrap(),
+            unsafe { &*self.parts.as_ptr() },
+        )
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct Param {
+
+    name: Option<StrRef>,
+
+    value: Option<StrRef>,
+}
+
+impl UrlInfo {
+
+    pub fn is_lazy_parsed(&self) -> bool {
+        self.path.get().is_some()
+    }
+
+    pub fn parse_if_needed(&self) {
+        if !self.is_lazy_parsed() {
+            self.lazy_parse();
+        }
+    }
+
+    /// Force lazy parsing of the URL to get the parameters and url path parts.
+    pub fn lazy_parse(&self) {
+        if self.original_url.is_empty() {
+            // Nothing to parse.
+            return;
+        }
+
+        let _lock = self.parse_mutex.lock().unwrap();
+
+        let path_parts = self.original_url.split('/');
+        let parts: Vec<StrRef> = {
+            let mut vec = Vec::with_capacity(path_parts.size_hint().0);
+            for part in path_parts {
+                vec.push(part.as_bytes().into());
+            }
+            vec
+        };
+        let last = parts.last().unwrap().clone();
+        let mut params_parts = last.as_ref().split('?');
+        let path = params_parts.next().unwrap();
+        let params = {
+            let mut vec = Vec::with_capacity(params_parts.size_hint().0);
+            for part in params_parts {
+                let starts_with_eq = part.starts_with('=');
+                let mut split = part.split('=');
+                let ptr = |v: &str| v.as_bytes().into();
+                let p = if starts_with_eq {
+                    Param {
+                        name: None,
+                        value: split.next().map(ptr),
+                    }
+                } else {
+                    Param {
+                        name: split.next().map(ptr),
+                        value: split.next().map(ptr),
+                    }
+                };
+                vec.push(p);
+            }
+            vec
+        };
+
+        self.params.set(params);
+        self.path.set(Some(path.as_bytes().into()));
+        self.parts.set(parts);
+    }
+}
+
+unsafe impl Sync for UrlInfo {}
+
+impl RequestContext {
+
+    pub fn original_url(&self) -> &str {
+        &self.url_info.original_url
+    }
+
+    pub fn params(&self) -> &Vec<Param> {
+        self.url_info.parse_if_needed();
+        unsafe { &*self.url_info.params.as_ptr() }
+    }
+
+    pub fn parts(&self) -> &Vec<StrRef> {
+        self.url_info.parse_if_needed();
+        unsafe { &*self.url_info.parts.as_ptr() }
+    }
+
+    pub fn path(&self) -> StrRef {
+        self.url_info.parse_if_needed();
+        self.url_info.path.get().unwrap()
+    }
 }
 
 #[derive(Debug)]
@@ -184,9 +356,7 @@ pub trait Process: Sized {
 #[async_trait]
 pub trait RouteHandle {
 
-    type R: ResponseContext;
-
-    async fn handle(self, req: RequestContext) -> Self::R;
+    async fn handle(&self, req: RequestContext) -> Box<dyn Data>;
 }
 
 #[async_trait]
